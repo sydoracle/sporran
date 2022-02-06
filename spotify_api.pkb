@@ -1,5 +1,8 @@
+set define off
+
 CREATE OR REPLACE PACKAGE spotify_api is
     FUNCTION get_token return varchar2;
+    procedure load_playlists;
 END spotify_api;
 /
 
@@ -40,64 +43,41 @@ CREATE OR REPLACE PACKAGE BODY spotify_api is
         --
     END get_token; 
     --
-end spotify_api;
-/
-
-    PROCEDURE refresh_playlists (p_token in varchar2 default null) IS
-    cursor c_pl is
-        select pl_owner_name, pl_name, pl_id, pl_href, pl_tracks_url, pl_tracks_cnt 
-        from spotify_playlist
-        where pl_owner_name = 'Gary'
-        and nvl(length(tracks_1_json),0) = 0
-        order by 1,2,3;
-    v_token varchar2(4000) := p_token;    
-BEGIN
+    procedure load_playlists is
+        v_offset    number := 1;
+        v_token     varchar2(2000);
+    begin
+        v_token := spotify_api.get_token;
+        delete from playlists;
+        while v_offset is not null loop
+            insert into playlists
+                (pl_id, pl_name, pl_owner_name, pl_desc, pl_tracks_url, pl_tracks_cnt, pl_json)
+            select j.*
+            from json_table(fnc_ws_get_json(
+                        'https://api.spotify.com/v1/me/playlists?limit=50&offset='||v_offset,
+                        'Bearer '||v_token),  '$.items[*]'
+                        columns  (
+                            pl_id           varchar2(800) PATH '$.id',
+                            pl_name         varchar2(800) PATH '$.name',
+                            pl_owner_name   varchar2(800) PATH '$.owner.display_name',
+                            pl_desc         varchar2(2000) PATH '$.description',
+                            pl_tracks_url   varchar2(800) PATH '$.tracks.href',
+                            pl_tracks_cnt   number PATH '$.tracks.total',
+                            pl_json  varchar2(4000) FORMAT JSON PATH '$')
+                        ) j;
+            dbms_session.sleep(2);
+            if sql%rowcount = 0 then
+                v_offset := null;
+            elsif v_offset > 1000 then
+                v_offset := null;
+            else
+                v_offset := v_offset + 50;
+            end if;
+        end loop;
+    end load_playlists;
     --
-    if v_token is null then
-        v_token := get_token;
-    end if;
     --
-    dbms_application_info.set_client_info('Playlist JSON');
-    --
-	delete from spotify_playlists;
-	insert into spotify_playlists (playlist_json)
-	select api_get_json('https://api.spotify.com/v1/me/playlists?limit=50&offset=1',
-		'Bearer '||v_token) playlist_json
-	from dual;
-    dbms_output.put_line('PL-Offset1:'||sql%rowcount);
-	insert into spotify_playlists (playlist_json)
-	select api_get_json('https://api.spotify.com/v1/me/playlists?limit=50&offset=50',
-		'Bearer '||v_token) playlist_json
-	from dual;
-    dbms_output.put_line('PL-Offset2:'||sql%rowcount);
-	insert into spotify_playlists (playlist_json)
-	select api_get_json('https://api.spotify.com/v1/me/playlists?limit=50&offset=99',
-		'Bearer '||v_token) playlist_json
-	from dual;
-    dbms_output.put_line('PL-Offset3:'||sql%rowcount);
-    --
-    dbms_application_info.set_client_info('Playlist table');
-    delete from spotify_playlist;
-    insert into spotify_playlist
-        (PL_DESC, PL_URL, PL_HREF, PL_ID, PL_NAME, PL_OWNER_NAME, PL_TYPE, PL_TRACKS_URL, PL_TRACKS_CNT)
-    select j.*
-    from spotify_playlists p
-            outer apply json_table(p.playlist_json,'$.items[*]'
-                            columns 
-                                (pl_desc        varchar2(2000) PATH '$.description' error on error,
-                                pl_url          varchar2(800) PATH '$.external_urls.spotify' error on error,
-                                pl_href         varchar2(800) PATH '$.href',
-                                pl_id           varchar2(800) PATH '$.id',
-                                pl_name         varchar2(800) PATH '$.name',
-                                pl_owner_name   varchar2(800) PATH '$.owner.display_name',
-                                pl_type         varchar2(800) PATH '$.type',
-                                pl_tracks_url   varchar2(800) PATH '$.tracks.href',
-                                pl_tracks_cnt   number PATH '$.tracks.total'
-                                )
-                        ) j ;
-    dbms_output.put_line('Playlists:'||sql%rowcount);
-    commit;
-    --
+    /*
     for r_main in c_pl loop
         dbms_application_info.set_client_info('Playlist track json'||r_main.pl_name);
         update spotify_playlist
@@ -117,7 +97,12 @@ BEGIN
         dbms_session.sleep(2);
     end loop;
     commit;
+    */
     --
-end refresh_spotify_playlists;
+end spotify_api;
 /
 
+BEGIN
+    spotify_api.load_playlists;
+end;
+/
