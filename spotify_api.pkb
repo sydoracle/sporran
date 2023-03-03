@@ -1,6 +1,6 @@
 set define off
 
-CREATE OR REPLACE EDITIONABLE PACKAGE BODY "SPOTIFY"."SPOTIFY_API" is
+create or replace PACKAGE BODY spotify_api is
     --
     g_token varchar2(32000);
     --
@@ -183,24 +183,29 @@ CREATE OR REPLACE EDITIONABLE PACKAGE BODY "SPOTIFY"."SPOTIFY_API" is
             v_offset := 0;
             while v_offset <= r_pl.pl_tracks_cnt loop
                 insert into playlist_tracks
+                    (pl_id, playlist_seq, t_id, t_name, 
+                    t_explicit, t_dur_mins, t_album_name, t_album_id, t_release_dt, 
+                    t_artists, t_album, t_track_json, added_at)
                 select  r_pl.pl_id pl_id, j.playlist_seq, j.t_id, j.t_name, 
                         j.t_explicit, round(j.t_duration/(1000*60),1) t_dur_mins, 
                         j.t_album_name, j.t_album_id, j.t_release_dt, 
-                        j.t_artists, j.t_album, j.t_track_json
+                        j.t_artists, j.t_album, j.t_track_json,
+                        to_date(t_added,'YYYY-MM-DD"T"HH24:MI:SS"Z"') t_added
                 from json_table(fnc_ws_get_json(r_pl.pl_tracks_url||'?limit=50&offset='||v_offset, 'Bearer '||v_token),
-                        '$.items[*].track'
+                        '$.items[*]'
                         columns  (
                             playlist_seq   FOR ORDINALITY,
-                            t_id           varchar2(800) PATH '$.id',
-                            t_name         varchar2(800) PATH '$.name',
-                            t_explicit     varchar2(800) PATH '$.explicit',
-                            t_duration     number        PATH '$.duration_ms',
-                            t_album_name   varchar2(800)  PATH '$.album.name',
-                            t_album_id     varchar2(800)  PATH '$.album.id',
-                            t_release_dt   varchar2(800)  PATH '$.album.release_date',
-                            t_artists      varchar2(4000) FORMAT JSON PATH '$.artists',
-                            t_album        varchar2(4000) FORMAT JSON PATH '$.album',
-                            t_track_json   clob FORMAT JSON PATH '$' error on error
+                            t_added        varchar2(80)  PATH '$.added_at',
+                            t_id           varchar2(800) PATH '$.track.id',
+                            t_name         varchar2(800) PATH '$.track.name',
+                            t_explicit     varchar2(800) PATH '$.track.explicit',
+                            t_duration     number        PATH '$.track.duration_ms',
+                            t_album_name   varchar2(800)  PATH '$.track.album.name',
+                            t_album_id     varchar2(800)  PATH '$.track.album.id',
+                            t_release_dt   varchar2(800)  PATH '$.track.album.release_date',
+                            t_artists      varchar2(4000) FORMAT JSON PATH '$.track.artists',
+                            t_album        varchar2(4000) FORMAT JSON PATH '$.track.album',
+                            t_track_json   clob FORMAT JSON PATH '$.track' error on error
                             )
                         ) j;
                 v_offset := v_offset + 50;
@@ -352,7 +357,8 @@ CREATE OR REPLACE EDITIONABLE PACKAGE BODY "SPOTIFY"."SPOTIFY_API" is
       p_dest_pl   in varchar2,
       p_src_pl    in varchar2 default null,
       p_t_id      in varchar2 default null, 
-      p_keep_yn   in varchar2 default 'N')
+      p_keep_yn   in varchar2 default 'N',
+      p_artist    in varchar2 default null)
     is
       cursor c_main is
          select   listagg(distinct 'spotify:track:'||t.t_id,',') within group (order by t.t_id) tracks,
@@ -362,6 +368,8 @@ CREATE OR REPLACE EDITIONABLE PACKAGE BODY "SPOTIFY"."SPOTIFY_API" is
                left outer join playlists p on pt.pl_id = p.pl_id
          where (instr(p_t_id,t.t_id) > 0 or p_t_id is null)
          and   (p.pl_id = p_src_pl or p_src_pl is null)
+         and   (p_artist is null 
+                    or instr(artist_names, '"'||translate(p_artist,' "',' ')||'"') > 0 )
          -- and t.tempo < 90 p.pl_name like 'Todo'
          order by tempo;
         v_res varchar2(32000);
@@ -463,7 +471,296 @@ CREATE OR REPLACE EDITIONABLE PACKAGE BODY "SPOTIFY"."SPOTIFY_API" is
     exception
         when others then
             commit;
-            raise_application_error(-20001,sqlerrm);
+            raise_application_error(-20001,sqlerrm,true);
     end  artist_albums;
+    --
+	procedure track_search (p_term in varchar2) is
+		v_search_cnt	number;
+		v_ins_cnt		number;
+		v_loop_cnt		number(2) := 1;
+		v_ret 			clob;
+		v_url 			varchar2(500) := 'https://api.spotify.com/v1/search?q=track:#SEARCH#&type=track&market=AU&limit=50&offset=';
+	begin
+		v_ret := fnc_ws_get_json(utl_url.escape(replace(v_url||'0','#SEARCH#',p_term)),'Bearer '||spotify_api.get_token);
+        --
+        select json_value(v_ret,'$.tracks.total')
+        into v_search_cnt
+        from dual;
+        --
+        if v_search_cnt > 999 then
+            v_search_cnt := 999;
+        end if;
+        --
+		v_ins_cnt := 0;
+		while v_ins_cnt < v_search_cnt loop
+			v_loop_cnt := v_loop_cnt + 1;
+            --
+			insert into spotify_search_result
+				(album_id, album_name, album_reldt, explicit, track_id, track_name, track_popular, artist_json, item_json)
+			select album_id, album_name, album_reldt, explicit, track_id, track_name, track_popular, artist_json, item_json
+			from json_table(v_ret,  '$.tracks.items[*]'
+				columns  (
+					album_id        varchar2(100) PATH '$.album.id',
+					album_name      varchar2(800) PATH '$.album.name',
+					album_reldt     varchar2(100) PATH '$.album.release_date',
+					explicit        varchar2(50)  PATH '$.explicit',
+					track_id        varchar2(100) PATH '$.id',
+					track_name      varchar2(800) PATH '$.name',
+					track_popular   varchar2(100) PATH '$.popularity',
+					artist_json     varchar2(4000) FORMAT JSON PATH '$.artists',
+					item_json       varchar2(4000) FORMAT JSON PATH '$'
+					)
+				) j;
+            if sql%rowcount = 0 then
+                --Assume we are done
+                v_ins_cnt := v_search_cnt;
+            else
+                --Increment 
+                v_ins_cnt := v_ins_cnt + sql%rowcount;
+                -- If we expect, request again
+                if v_ins_cnt < v_search_cnt
+                and sql%rowcount > 1 then
+                    dbms_session.sleep(1);
+                    if v_ins_cnt >= 950 then
+                        v_ins_cnt := 949;
+                    end if;
+                    v_ret := fnc_ws_get_json(utl_url.escape(replace(v_url||(v_ins_cnt+1),'#SEARCH#',p_term)),
+                        'Bearer '||spotify_api.get_token);
+                else
+                    v_ret := null;
+                end if;
+            end if;
+		end loop;
+		dbms_output.put_line(p_term||':'||v_ins_cnt);
+	end track_search;
+    --
+    procedure del_dups is
+      cursor c_main is
+		with
+			pt as
+				(select p.pl_id, p.pl_name, p.pl_desc, pt.t_name, pt.t_explicit, pt.t_id, pt.added_at
+				from playlists p
+						join playlist_tracks pt on pt.pl_id = p.pl_id 
+				where p.pl_owner_name = 'Gary'
+				and p.pl_name not in ('Comedy',' Audiobooks','2020 Top','Doppelganger','Man Cave')
+				and regexp_substr(nvl(p.pl_desc,'?'),'[^ ]+') not in ('Dedications','Premade','Themed')
+				),
+			dup as
+				(select pt.t_name, t_id, 
+						min(pl_id) keep (DENSE_RANK FIRST ORDER BY added_at asc)    first_pl_id,
+						min(pl_name) keep (DENSE_RANK FIRST ORDER BY added_at asc)  first_pl_name,
+						min(pl_desc) keep (DENSE_RANK FIRST ORDER BY added_at asc)  first_pl_desc,
+						min(added_at) keep (DENSE_RANK FIRST ORDER BY added_at asc) first_pl_add,
+						min(pl_id) keep (DENSE_RANK FIRST ORDER BY added_at desc)    last_pl_id,
+						min(pl_name) keep (DENSE_RANK FIRST ORDER BY added_at desc)  last_pl_name,
+						min(pl_desc) keep (DENSE_RANK FIRST ORDER BY added_at desc)  last_pl_desc,
+						min(added_at) keep (DENSE_RANK FIRST ORDER BY added_at desc) last_pl_add
+				from pt
+				group by t_id, pt.t_name
+				having count(distinct pl_id) = 2)
+		select first_pl_name, first_pl_id, 
+				listagg(distinct 'spotify:track:'||t_id,',') within group (order by t_id) tracks,
+				json_object(key 'tracks' value json_arrayagg(json_object(key 'uri' value 'spotify:track:'||t_id) )) json_tracks
+		from dup
+		group by first_pl_name, first_pl_id;
+        v_res varchar2(32000);
+        v_pl_id varchar2(100);
+    begin
+        --
+        for r_main in c_main loop
+               v_res := fnc_url_to_clob (
+                        p_url       =>  'https://api.spotify.com/v1/playlists/'||r_main.first_pl_id||'/tracks',
+                        p_method    =>  'DELETE', 
+                        p_header    =>  'Authorization: Bearer '||spotify_api.get_token,
+                        p_post_data => r_main.json_tracks
+                        );
+        end loop;
+    end del_dups;
+    --
+   procedure order_tracks (p_name in varchar2 default '%') is
+      cursor c_main is
+		with
+			pt as
+				(select p.pl_id, p.pl_name, p.pl_desc, pt.t_name, pt.t_explicit, pt.t_id, pt.added_at,
+                        json_value(t_artists,'$[0].name') primary_artist
+				from playlists p
+						left outer join playlist_tracks pt on pt.pl_id = p.pl_id 
+				where p.pl_owner_name = 'Gary'
+				and p.pl_name not in ('Comedy',' Audiobooks','2020 Top','Doppelganger','Man Cave')
+                and p.pl_name like nvl(p_name,'%')
+				and regexp_substr(nvl(p.pl_desc,'?'),'[^ ]+') not in ('Dedications','Premade','Themed')
+				)
+        select pl_desc, pl_name, pl_id, count(*) c_all,
+                listagg(distinct 'spotify:track:'||t_id,',') within group (order by primary_artist, t_name, t_id, added_at) tracks
+                /*,
+                json_object(key 'uris' value json_arrayagg(
+                        json_object(key 'uri' value 'spotify:track:'||t_id) order by primary_artist, t_name, t_id, added_at
+                    )) json_tracks
+                */
+        from pt
+        group by pl_desc, pl_name, pl_id
+        order by 1,2,3;
+        v_res varchar2(32000);
+        v_pl_id varchar2(100);
+    begin
+        --
+        for r_main in c_main loop
+               v_res := fnc_url_to_clob (
+                        p_url       =>  'https://api.spotify.com/v1/playlists/'||r_main.pl_id||'/tracks?uris='||r_main.tracks,
+                        p_method    =>  'PUT', 
+                        p_header    =>  'Authorization: Bearer '||spotify_api.get_token,
+                        p_post_data => null--r_main.json_tracks
+                        );
+                dbms_output.put_line(r_main.pl_desc||':'||r_main.pl_name||':'||v_res);
+                dbms_session.sleep(1);
+        end loop;
+    end order_tracks;
+    --
+    procedure balance_playlists (p_pl_name1 in varchar2, p_pl_name2 in varchar2)
+    is
+        v_res varchar2(32000);
+        cursor c_main is
+            with
+                pt as
+                    (select p.pl_id, p.pl_name, p.pl_desc, pt.t_name, pt.t_explicit, pt.t_id, pt.added_at,
+                            json_value(t_artists,'$[0].name') artist_0,
+                            json_value(t_artists,'$[1].name') artist_1
+                    from playlists p
+                            left outer join playlist_tracks pt on pt.pl_id = p.pl_id 
+                    where p.pl_name in (p_pl_name1,p_pl_name2)
+                    and p.pl_owner_name = 'Gary'
+                    ),
+                g as
+                    (select mod(ora_hash(artist_0,10),2) grp, count(*) cnt,
+                            listagg(distinct 'spotify:track:'||t_id,',') within group (order by artist_0, t_name, t_id, added_at) tracks
+                    from pt
+                    where t_id is not null
+                    group by mod(ora_hash(artist_0,10),2)
+                    ),
+                p as
+                    (select min(pl_id) pl_id1, max(pl_id) pl_id2
+                    from pt
+                    having count(distinct pl_id) = 2)
+            select g.grp, decode(g.grp,1,pl_id1,pl_id2) dest_pl, g.cnt, g.tracks
+            from g cross join p;
+    begin
+        for r_main in c_main loop
+           v_res := fnc_url_to_clob (
+                    p_url       =>  'https://api.spotify.com/v1/playlists/'||r_main.dest_pl||'/tracks?uris='||r_main.tracks,
+                    p_method    =>  'PUT', 
+                    p_header    =>  'Authorization: Bearer '||spotify_api.get_token,
+                    p_post_data => null--r_main.json_tracks
+                    );
+            dbms_output.put_line(r_main.dest_pl||':'||r_main.cnt||':'||v_res);
+            dbms_session.sleep(1);
+        end loop;
+    end balance_playlists;
+    --
+    procedure get_follows is
+        v_cnt       number := 999;
+        v_start     varchar2(100);
+    begin
+        while v_cnt > 1 loop
+            --
+            select max('&after='||a_id) id
+            into v_start
+            from followed_artists
+            where as_of_time >= sysdate -(1/24);
+            --
+            MERGE INTO followed_artists D
+               USING (select j.*
+                    from json_table(
+                            fnc_ws_get_json('https://api.spotify.com/v1/me/following?type=artist'||v_start, 'Bearer '||spotify_api.get_token),
+                                '$.artists.items[*]'
+                                    columns  (
+                                        art_id           varchar2(800) PATH '$.id',
+                                        art_name         varchar2(800) PATH '$.name',
+                                        art_popularity   NUMBER PATH '$.popularity',
+                                        art_follower_cnt NUMBER PATH '$.followers.total',
+                                        art_type         VARCHAR2 PATH '$.type',
+                                        art_genre        varchar2(800) FORMAT JSON PATH '$.genres')
+                            ) j) s
+               ON (d.a_id = s.art_id )
+               WHEN MATCHED THEN UPDATE 
+                SET d.as_of_time = sysdate
+               WHEN NOT MATCHED THEN INSERT 
+                    (a_id, a_name, follower_cnt, popularity, genres, a_type, as_of_time)
+                 VALUES (s.art_id, s.art_name, s.art_follower_cnt, s.art_popularity, s.art_genre, s.art_type, sysdate);
+            v_cnt := sql%rowcount;
+        end loop;
+        commit;
+    end get_follows;
+    --
+    procedure add_follows
+    is
+        cursor c_main is
+            with
+                a as
+                    (select distinct a_id
+                    from track_artists t
+                    where pl_owner_name = 'Gary'
+                    and pl_name not in ('Comedy',' Audiobooks')
+                    and t.a_id not in (select f.a_id from followed_artists f where f.a_id is not null)
+                    order by a_id
+                    fetch first 40 rows only
+                    )
+            select listagg('"'||a_id||'"',',') within group (order by a_id) ids
+            from a;
+        v_res varchar2(2000);
+    begin
+        commit;
+        --
+        execute immediate 'ALTER SESSION DISABLE PARALLEL DML';
+        execute immediate 'ALTER SESSION DISABLE PARALLEL DDL';
+        execute immediate 'ALTER SESSION DISABLE PARALLEL QUERY';
+        --
+        get_follows;
+        --
+        insert into track_artists
+            (pl_owner_name, pl_name, pl_id, 
+            t_id, t_name, t_album_name, 
+            a_name, a_id)
+        select distinct 
+                p.pl_owner_name, p.pl_name, p.pl_id, 
+                t.t_id, t.t_name, t.t_album_name,
+                j.a_name, j.a_id
+        from playlist_tracks t
+                join playlists p on p.pl_id = t.pl_id
+                outer apply json_table(t.t_artists,'$[*]'
+                        columns (
+                            a_name        varchar2(400) PATH '$.name' null on empty error on error,
+                            a_type        varchar2(400) PATH '$.type' null on empty error on error,
+                            a_id          varchar2(400) PATH '$.id' null on empty error on error)
+                        ) j
+        where t_id not in (select ta.t_id from  track_artists ta);
+        --
+        commit;
+        --
+        for r_main in c_main loop
+            v_res := fnc_url_to_clob (
+                    p_url       =>  'https://api.spotify.com/v1/me/following?type=artist', /*&ids='||r_main.ids,*/
+                    p_method    =>  'PUT', 
+                    p_header    =>  'Authorization: Bearer '||spotify_api.get_token,
+                    p_post_data => '{ids:['||r_main.ids||']}'
+                    );
+            dbms_output.put_line(':'||v_res);
+        end loop;
+        --
+        commit;
+        --
+    end add_follows;
+    --
+    procedure set_pl_desc (p_pl_id in varchar2, p_desc in varchar2) 
+    is
+        v_resp varchar2(4000);
+    begin
+        v_resp := fnc_url_to_clob (
+           p_url       =>  'https://api.spotify.com/v1/playlists/'||p_pl_id,
+           p_method    =>  'PUT', 
+           p_header    =>  'Authorization: Bearer '||spotify_api.get_token,
+           p_post_data => '{"description": "'||p_desc||'"}'
+           );
+    end set_pl_desc;
+    --
 end spotify_api;
 /
