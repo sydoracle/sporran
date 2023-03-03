@@ -21,9 +21,16 @@ begin
         end if;
     end if;
     --
+    if p_method = 'PUT'
+    and p_header not like '%Content-Type%' then
+        utl_http.set_header(v_req, 'Content-Type', 'application/json');
+    end if;
+    --
     if p_post_data is not null then
         utl_http.set_header(v_req, 'content-length',lengthb(p_post_data));
         utl_http.write_text (v_req, p_post_data);
+    elsif p_method = 'PUT' then
+        utl_http.set_header(v_req, 'content-length',0);
     end if;
     --
     v_rsp := utl_http.get_response(v_req);
