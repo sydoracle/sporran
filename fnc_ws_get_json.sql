@@ -1,4 +1,4 @@
-CREATE OR REPLACE FUNCTION fnc_ws_get_json (p_url in varchar2, p_auth in varchar2 default null) 
+create or replace FUNCTION fnc_ws_get_json (p_url in varchar2, p_auth in varchar2 default null) 
 return clob is
     v_result clob;
 begin
@@ -18,7 +18,13 @@ begin
         dbms_output.put_line('A:'||APEX_WEB_SERVICE.g_status_code);
         dbms_output.put_line('B:'||APEX_WEB_SERVICE.g_reason_phrase);
         dbms_output.put_line('C:'||p_url);
+        for i in 1.. apex_web_service.g_headers.count loop
+            dbms_output.put_line('D'||i||':'||apex_web_service.g_headers(i).name||'='||apex_web_service.g_headers(i).value);
+        end loop;
     end if;
+    --for i in 1.. apex_web_service.g_headers.count loop
+    --    dbms_output.put_line('D'||i||':'||apex_web_service.g_headers(i).name||'='||apex_web_service.g_headers(i).value);
+    --end loop;
     return v_result;
 end fnc_ws_get_json;
 /
